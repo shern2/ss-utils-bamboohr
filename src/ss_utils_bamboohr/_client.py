@@ -407,7 +407,13 @@ class BambooHRClient:
 
                         (raw_dir / final_filename).write_bytes(file_bytes)
                     except Exception as e:
-                        logger.warning("Failed to download file %s (ID %s): %s", filename_base, file_id, e)
+                        logger.error("Failed to download file %s (ID %s): %s. Failing fast.", filename_base, file_id, e)
+                        # Cleanup app_dir on failure to ensure we don't leave partial data
+                        import shutil
+
+                        if app_dir.exists():
+                            shutil.rmtree(app_dir)
+                        raise
 
                 logger.info("Processed: %s", app_dir_name)
                 stats["processed"] += 1
