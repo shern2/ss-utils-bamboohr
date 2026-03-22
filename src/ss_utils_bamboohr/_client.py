@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import backoff
 import httpx
@@ -195,7 +196,7 @@ class BambooHRClient:
         # and it's not under /api/v1/
         async with httpx.AsyncClient(base_url=self._base_url) as client:
             response = await client.get(url, params=params, headers=headers, follow_redirects=True)
-            if response.status_code == 200 and "login" not in str(response.url).lower():
+            if response.status_code == httpx.codes.OK and "login" not in str(response.url).lower():
                 return response.content
 
             raise ValueError(
@@ -283,6 +284,121 @@ class BambooHRClient:
             return None
         return await self.download_file(detail.resumeFileId)
 
+
+    async def fetch_one_candidate_pipeline(
+        self,
+        application_id: int,
+        output_base: str | Path,
+        skip_existing: bool = True,
+        app_summary: ApplicationSummary | None = None,
+    ) -> Literal["processed", "skipped", "error"]:
+        """Process a single candidate by application ID.
+
+        Args:
+            application_id: BambooHR application ID.
+            output_base: Base directory for output.
+            skip_existing: If True, skip if application.yaml already exists.
+            app_summary: Optional summary object to avoid redundant API call for directory structure.
+
+        Returns:
+            Status string: "processed", "skipped", or "error".
+        """
+        output_base = Path(output_base)
+        try:
+            # 1. Prepare directory structure (using summary if available to avoid API call)
+            if app_summary:
+                job_title = (
+                    app_summary.job.title if isinstance(app_summary.job.title, str) else app_summary.job.title.label
+                )
+                job_id = app_summary.job.id
+                applicant_name = f"{app_summary.applicant.firstName} {app_summary.applicant.lastName}"
+                app_id = app_summary.id
+                detail = None  # To be fetched later if needed
+            else:
+                # We'll need the full detail anyway, but let's check idempotency first if we can.
+                # However, without the summary or detail, we don't know the directory names.
+                # So we must fetch the detail.
+                detail = await self.get_application(application_id)
+                job_title = detail.job.title if isinstance(detail.job.title, str) else detail.job.title.label
+                job_id = detail.job.id
+                applicant_name = f"{detail.applicant.firstName} {detail.applicant.lastName}"
+                app_id = detail.id
+
+            job_dir_name = f"{job_title} ({job_id})"
+            app_dir_name = f"{applicant_name} ({app_id})"
+
+            app_dir = output_base / "jobs" / job_dir_name / app_dir_name
+            yaml_path = app_dir / "application.yaml"
+            raw_dir = app_dir / "raw"
+
+            # 2. Idempotency check
+            if skip_existing and yaml_path.exists():
+                logger.info("Skipping existing candidate: %s", app_dir_name)
+                return "skipped"
+
+            # 3. Fetch full detail (if not already fetched in step 1)
+            if detail is None:
+                detail = await self.get_application(application_id)
+
+            # 4. Create directories
+            app_dir.mkdir(parents=True, exist_ok=True)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+
+            # 5. Save application.yaml (Agent Context)
+            # Strip out noisy fields like avatar
+            data = detail.model_dump()
+            if "applicant" in data and "avatar" in data["applicant"]:
+                data["applicant"]["avatar"] = None
+            if "job" in data and "hiringLead" in data["job"] and data["job"]["hiringLead"]:
+                data["job"]["hiringLead"]["avatar"] = None
+
+            yaml_content = yaml.dump(data, sort_keys=False, allow_unicode=True)
+            yaml_path.write_text(yaml_content, encoding="utf-8")
+
+            # 6. Download attachments (resume, cover letter, and extra attachments)
+            file_tasks = []
+            if detail.resumeFileId:
+                file_tasks.append(("resume", detail.resumeFileId))
+            if detail.coverLetterFileId:
+                file_tasks.append(("cover_letter", detail.coverLetterFileId))
+            if detail.attachments:
+                for attachment in detail.attachments:
+                    if "id" in attachment:
+                        # Use original filename if available, otherwise fallback to 'attachment_{id}'
+                        name_hint = attachment.get("fileName", f"attachment_{attachment['id']}")
+                        file_tasks.append((name_hint, attachment["id"]))
+
+            for filename_base, file_id in file_tasks:
+                try:
+                    file_bytes = await self.download_file(file_id)
+                    ext = get_file_extension(file_bytes)
+                    # If filename_base already has an extension that matches or is common, use it
+                    # but for resume/cover_letter we prefer our detected extension
+                    if filename_base in ("resume", "cover_letter"):
+                        final_filename = f"{filename_base}.{ext}"
+                    else:
+                        # For other attachments, try to preserve name but ensure extension
+                        if "." in filename_base:
+                            final_filename = filename_base
+                        else:
+                            final_filename = f"{filename_base}.{ext}"
+
+                    (raw_dir / final_filename).write_bytes(file_bytes)
+                except Exception as e:
+                    logger.error("Failed to download file %s (ID %s): %s. Failing fast.", filename_base, file_id, e)
+                    # Cleanup app_dir on failure to ensure we don't leave partial data
+                    if app_dir.exists():
+                        shutil.rmtree(app_dir)
+                    raise
+
+            logger.info("Processed: %s", app_dir_name)
+            return "processed"
+
+        except Exception as e:
+            logger.error("Failed to process application %s: %s", application_id, e, exc_info=True)
+            return "error"
+
+
     async def fetch_candidates_pipeline(
         self,
         output_base: str | Path,
@@ -340,86 +456,17 @@ class BambooHRClient:
             all_applications.extend(apps)
 
         for app_summary in all_applications:
-            try:
-                # 1. Prepare directory structure
-                job_title = (
-                    app_summary.job.title if isinstance(app_summary.job.title, str) else app_summary.job.title.label
-                )
-                job_dir_name = f"{job_title} ({app_summary.job.id})"
-                applicant_name = f"{app_summary.applicant.firstName} {app_summary.applicant.lastName}"
-                app_dir_name = f"{applicant_name} ({app_summary.id})"
-
-                app_dir = output_base / "jobs" / job_dir_name / app_dir_name
-                yaml_path = app_dir / "application.yaml"
-                raw_dir = app_dir / "raw"
-
-                # 2. Idempotency check
-                if skip_existing and yaml_path.exists():
-                    logger.info("Skipping existing candidate: %s", app_dir_name)
-                    stats["skipped"] += 1
-                    continue
-
-                # 3. Fetch full detail
-                detail = await self.get_application(app_summary.id)
-
-                # 4. Create directories
-                app_dir.mkdir(parents=True, exist_ok=True)
-                raw_dir.mkdir(parents=True, exist_ok=True)
-
-                # 5. Save application.yaml (Agent Context)
-                # Strip out noisy fields like avatar
-                data = detail.model_dump()
-                if "applicant" in data and "avatar" in data["applicant"]:
-                    data["applicant"]["avatar"] = None
-                if "job" in data and "hiringLead" in data["job"] and data["job"]["hiringLead"]:
-                    data["job"]["hiringLead"]["avatar"] = None
-
-                yaml_content = yaml.dump(data, sort_keys=False, allow_unicode=True)
-                yaml_path.write_text(yaml_content, encoding="utf-8")
-
-                # 6. Download attachments (resume, cover letter, and extra attachments)
-                file_tasks = []
-                if detail.resumeFileId:
-                    file_tasks.append(("resume", detail.resumeFileId))
-                if detail.coverLetterFileId:
-                    file_tasks.append(("cover_letter", detail.coverLetterFileId))
-                if detail.attachments:
-                    for attachment in detail.attachments:
-                        if "id" in attachment:
-                            # Use original filename if available, otherwise fallback to 'attachment_{id}'
-                            name_hint = attachment.get("fileName", f"attachment_{attachment['id']}")
-                            file_tasks.append((name_hint, attachment["id"]))
-
-                for filename_base, file_id in file_tasks:
-                    try:
-                        file_bytes = await self.download_file(file_id)
-                        ext = get_file_extension(file_bytes)
-                        # If filename_base already has an extension that matches or is common, use it
-                        # but for resume/cover_letter we prefer our detected extension
-                        if filename_base in ("resume", "cover_letter"):
-                            final_filename = f"{filename_base}.{ext}"
-                        else:
-                            # For other attachments, try to preserve name but ensure extension
-                            if "." in filename_base:
-                                final_filename = filename_base
-                            else:
-                                final_filename = f"{filename_base}.{ext}"
-
-                        (raw_dir / final_filename).write_bytes(file_bytes)
-                    except Exception as e:
-                        logger.error("Failed to download file %s (ID %s): %s. Failing fast.", filename_base, file_id, e)
-                        # Cleanup app_dir on failure to ensure we don't leave partial data
-                        import shutil
-
-                        if app_dir.exists():
-                            shutil.rmtree(app_dir)
-                        raise
-
-                logger.info("Processed: %s", app_dir_name)
+            status = await self.fetch_one_candidate_pipeline(
+                application_id=app_summary.id,
+                output_base=output_base,
+                skip_existing=skip_existing,
+                app_summary=app_summary,
+            )
+            if status == "processed":
                 stats["processed"] += 1
-
-            except Exception as e:
-                logger.error("Failed to process application %s: %s", app_summary.id, e, exc_info=True)
+            elif status == "skipped":
+                stats["skipped"] += 1
+            else:
                 stats["errors"] += 1
 
         return stats
