@@ -1,6 +1,6 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-json
       - id: check-merge-conflict
@@ -17,11 +17,11 @@ repos:
       #   - --autofix
       - id: trailing-whitespace
   - repo: https://github.com/jsh9/pydoclint
-    rev: 0.6.7
+    rev: 0.8.7
     hooks:
       - id: pydoclint
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.4
+    rev: v0.15.9
     hooks:
       - id: ruff-format
       - id: ruff-check
