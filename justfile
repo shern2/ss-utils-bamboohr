@@ -87,57 +87,84 @@ rsync-for-gemini-gem dest="/tmp/ss-utils-bamboohr/":
 # ==========================================
 # 🚀 Publishing
 # ==========================================
+# Policy: patch by default; minor for features; major only for breaks.
+# A release is a tag on this branch — there is no release branch. See RELEASING.md.
 
-# Publish to PyPI (e.g., just publish v0.0.2)
+# Install the just-built wheel in a throwaway venv; assert metadata + import.
+[private]
+_verify_wheel version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PROJECT_NAME=$(grep -m 1 '^name = ' pyproject.toml | cut -d '"' -f 2)
+    MODULE=${PROJECT_NAME//-/_}
+    DIST=$(ls dist/*.whl 2>/dev/null | head -1)
+    if [ -z "$DIST" ]; then
+        echo "❌ {{RED}}Error: no wheel in dist/. Run 'uv build' first.{{RESET}}"
+        exit 1
+    fi
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    uv venv "$TMP/venv" >/dev/null
+    uv pip install --python "$TMP/venv/bin/python" "$DIST" >/dev/null
+    GOT=$("$TMP/venv/bin/python" -c 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' "$PROJECT_NAME")
+    if [[ "$GOT" != "{{version}}" ]]; then
+        echo "❌ {{RED}}Error: wheel reports $GOT, expected {{version}}{{RESET}}"
+        exit 1
+    fi
+    "$TMP/venv/bin/python" -c "import ${MODULE}" >/dev/null
+    echo "✅ {{GREEN}}wheel ok: ${PROJECT_NAME}==${GOT} (${MODULE} imports){{RESET}}"
+
+# Verify the published artifact installs from the registry and reports its version.
+# Usage: just verify-release [version]
+[group('Publishing')]
+verify-release version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PROJECT_NAME=$(grep -m 1 '^name = ' pyproject.toml | cut -d '"' -f 2)
+    MODULE=${PROJECT_NAME//-/_}
+    VERSION="{{version}}"
+    if [ -z "$VERSION" ]; then
+        VERSION=$(uv version --short)
+    fi
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    uv venv "$TMP/venv" >/dev/null
+    uv pip install --python "$TMP/venv/bin/python" "${PROJECT_NAME}==${VERSION}" >/dev/null
+    GOT=$("$TMP/venv/bin/python" -c 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' "$PROJECT_NAME")
+    if [[ "$GOT" != "$VERSION" ]]; then
+        echo "❌ {{RED}}Error: registry serves $GOT, expected $VERSION{{RESET}}"
+        exit 1
+    fi
+    "$TMP/venv/bin/python" -c "import ${MODULE}" >/dev/null
+    echo "✅ {{GREEN}}registry ok: ${PROJECT_NAME}==${GOT}{{RESET}}"
+
+# Publish the existing dist/ artifact (builds only if dist/ is empty).
+# Usage: just publish [version]
 [group('Publishing')]
 publish version="":
     #!/usr/bin/env bash
     set -euo pipefail
 
     VERSION="{{version}}"
-    if [ -z "$VERSION" ]; then
-        VERSION=$(uv version | awk '{print $NF}')
-    else
+    if [ -n "$VERSION" ]; then
         echo "🏷️ {{YELLOW}}Setting version to $VERSION...{{RESET}}"
         uv version "$VERSION"
     fi
+    VERSION=$(uv version --short)
 
-    echo "📦 {{YELLOW}}Publishing $VERSION to PyPI...{{RESET}}"
-    rm -rf dist/*
-    uv build
-    
-    # Load environment variables for UV_PUBLISH_TOKEN
-    if [ -f .env ]; then
-        source .env
+    echo "📦 {{YELLOW}}Publishing $VERSION...{{RESET}}"
+    if ! ls dist/*.whl >/dev/null 2>&1; then
+        uv build
     fi
-
+    if [ -f .env ]; then source .env; fi
     if [ -z "${UV_PUBLISH_TOKEN:-}" ]; then
-        echo "❌ {{RED}}Error: UV_PUBLISH_TOKEN is not set.{{RESET}}"
+        echo "❌ {{RED}}Error: UV_PUBLISH_TOKEN is not set. Add it to .env or export it.{{RESET}}"
         exit 1
     fi
-
     uv publish --token="$UV_PUBLISH_TOKEN"
 
-    # Push Github tag and create release
-    echo "🏷️ {{YELLOW}}Creating GitHub tag and release for $VERSION...{{RESET}}"
-    # Check if tag already exists
-    if git rev-parse "$VERSION" >/dev/null 2>&1; then
-        echo "⚠️  {{YELLOW}}Tag $VERSION already exists, skipping tag creation.{{RESET}}"
-    else
-        git tag -a "$VERSION" -m "Release version $VERSION"
-        git push origin "$VERSION"
-    fi
-
-    # Check if release already exists
-    if gh release view "$VERSION" >/dev/null 2>&1; then
-        echo "⚠️  {{YELLOW}}Release $VERSION already exists, skipping release creation.{{RESET}}"
-    else
-        gh release create "$VERSION" \
-          --title "$VERSION" \
-          --notes "Release version $VERSION"
-    fi
-
-# `just bump patch` (patch version bump) ; `just bump minor false` (minor version bump; skips git check) ; `just bump major`
+# Release: build once, verify the wheel, write the record, publish, verify the
+# registry, then tag. Usage: just bump [patch|minor|major] [verify=true]
 [group('Publishing')]
 bump bump="patch" verify="true":
     #!/usr/bin/env bash
@@ -150,31 +177,67 @@ bump bump="patch" verify="true":
             exit 1
         fi
     else
-        echo "⚠️  {{YELLOW}}Warning: Skipping git status verification (--no-verify){{RESET}}"
+        echo "⚠️  {{YELLOW}}Warning: Skipping git status check{{RESET}}"
     fi
+
+    PROJECT_NAME=$(grep -m 1 '^name = ' pyproject.toml | cut -d '"' -f 2)
+    TAG_PREFIX="${PROJECT_NAME}-v"
+
+    CUR=$(uv version --short)
+    if [[ "$CUR" == *rc* || "$CUR" == *a* || "$CUR" == *b* ]]; then
+        echo "❌ {{RED}}Error: $CUR is a prerelease. Finalise it first:{{RESET}}"
+        echo "   uv version ${CUR%%rc*}; then: just publish && just verify-release"
+        exit 1
+    fi
+
+    echo "🧪 {{YELLOW}}Running tests before release...{{RESET}}"
+    just env={{env}} test-unit
 
     echo "📈 {{YELLOW}}Bumping {{bump}} version...{{RESET}}"
     uv version --bump {{bump}}
+    NEW=$(uv version --short)
 
-    NEW_VERSION=$(uv version | awk '{print $NF}')
+    echo "🏗️ {{YELLOW}}Building and verifying $NEW...{{RESET}}"
+    rm -rf dist
+    uv build
+    just _verify_wheel "$NEW"
 
-    if [[ -z "$NEW_VERSION" ]]; then
-         echo "❌ {{RED}}Error: Could not extract version. Output: $(uv version){{RESET}}"
-         exit 1
-    fi
+    echo "📝 {{YELLOW}}Writing releases/v$NEW.md...{{RESET}}"
+    mkdir -p releases
+    PREV=$(git describe --tags --abbrev=0 --match "${TAG_PREFIX}*" 2>/dev/null || true)
+    sed -e "s/__VERSION__/$NEW/g" -e "s/__DATE__/$(date +%F)/g" releases/_template.md > "releases/v$NEW.md"
+    echo "" >> "releases/v$NEW.md"
+    echo "## Shipped" >> "releases/v$NEW.md"
+    echo "" >> "releases/v$NEW.md"
+    git log --no-merges --pretty='- %s (%h)' ${PREV:+$PREV..HEAD} >> "releases/v$NEW.md"
+    echo "" >> "releases/v$NEW.md"
+    echo "_Local wheel verification passed before publish._" >> "releases/v$NEW.md"
 
-    echo "🏷️ {{YELLOW}}Tagging v$NEW_VERSION...{{RESET}}"
-    NEW_VERSION=$(uv version | awk '{print $NF}')
-    PROJECT_NAME=$(grep -m 1 "^name = " pyproject.toml | cut -d '"' -f 2)
+    git add pyproject.toml uv.lock releases/
+    git commit -m "chore(release): [$PROJECT_NAME] bump version to $NEW"
 
-    git add pyproject.toml uv.lock
-    git commit -m "chore(release): [$PROJECT_NAME] bump version to $NEW_VERSION"
-    git tag "$PROJECT_NAME-v$NEW_VERSION"
-    git push origin "$PROJECT_NAME-v$NEW_VERSION"
+    echo "📦 {{YELLOW}}Publishing $NEW...{{RESET}}"
+    just env={{env}} publish "$NEW"
+
+    echo "🔎 {{YELLOW}}Verifying the published artifact...{{RESET}}"
+    just env={{env}} verify-release "$NEW"
+    sed -i '' "s|^- registry: .*|- registry: \`${PROJECT_NAME}==${NEW}\` installs and reports ${NEW}|" "releases/v$NEW.md" 2>/dev/null || \
+        sed -i "s|^- registry: .*|- registry: \`${PROJECT_NAME}==${NEW}\` installs and reports ${NEW}|" "releases/v$NEW.md"
+    git add "releases/v$NEW.md"
+    git commit --amend --no-edit
+
+    echo "🏷️ {{YELLOW}}Tagging $TAG_PREFIX$NEW...{{RESET}}"
+    git tag "$TAG_PREFIX$NEW"
+    git push origin "$TAG_PREFIX$NEW"
     git push
 
-    just env={{env}} publish
-
+    echo ""
+    echo "✅ {{GREEN}}Released $PROJECT_NAME $NEW{{RESET}}"
+    echo "   Retro: add up to 3 friction items to releases/v$NEW.md,"
+    echo "   then edit RELEASING.md — not product code. See RELEASING.md."
+    if command -v gh >/dev/null 2>&1; then
+        gh release create "$TAG_PREFIX$NEW" --title "$NEW" --notes "Release $NEW" >/dev/null 2>&1 || true
+    fi
 
 # ==========================================
 # 🔒 Internal Helpers
